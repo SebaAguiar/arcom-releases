@@ -1,0 +1,20 @@
+# Local build artifacts — never commit these
+dist/
+target/
+release/
+*.AppImage
+*.deb
+*.rpm
+*.msi
+*.nsis.exe
+*.dmg
+*.sig
+
+# Local tooling
+.vscode/
+.idea/
+*.iml
+
+# OS noise
+.DS_Store
+Thumbs.db
