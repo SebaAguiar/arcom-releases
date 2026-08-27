@@ -1,0 +1,82 @@
+name: Reportar un bug
+description: Reportá un problema o error de Arcom POS para que podamos corregirlo.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por tomarte el tiempo de reportar. Completá los datos abajo para
+        que podamos reproducir y corregir el problema.
+
+  - type: input
+    id: version
+    attributes:
+      label: Versión de Arcom
+      description: ¿Qué versión aparece en Configuración → Sistema → Actualizar?
+      placeholder: "Ej: 1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Sistema operativo
+      description: ¿En qué sistema operativo ocurre?
+      options:
+        - Windows
+        - macOS
+        - Linux (AppImage)
+        - Linux (Debian/Ubuntu)
+        - Linux (Fedora/RPM)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: ¿Qué pasó?
+      description: Contanos qué pasó, con el mayor detalle posible.
+      placeholder: "Ej: Al emitir una factura, la app se quedó en 'Pendiente' y nunca se emitió."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: ¿Qué esperabas que pasara?
+      placeholder: "Ej: La factura debía emitirse y mostrar el CAE."
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Pasos para reproducir
+      description: Contanos los pasos exactos para volver a generar el problema.
+      placeholder: |
+        1. Abrí Arcom
+        2. Fui a ...
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: stacktrace
+    attributes:
+      label: Error / consola
+      description: Si aparece un mensaje de error, pegá el texto exacto (o un screenshot).
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: data-involved
+    attributes:
+      label: Datos sensibles
+      description: Marcá si el issue involucra estos datos (para priorizar privacidad).
+      options:
+        - label: Contiene datos de facturación (CUIT, CAE, comprobantes)
+        - label: Contiene datos de clientes o ventas
+        - label: Contiene capturas de pantalla con datos reales
+    validations:
+      required: false

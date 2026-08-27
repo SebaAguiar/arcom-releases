@@ -1,0 +1,49 @@
+name: Solicitar una función
+description: Proponé una nueva función o mejora para Arcom POS.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por tu sugerencia. Contanos qué te gustaría que Arcom haga
+        para evaluarla.
+
+  - type: input
+    id: problem
+    attributes:
+      label: ¿Qué problema resolvés hoy con otro método?
+      description: Contanos qué necesidad no cubre Arcom actualmente.
+      placeholder: "Ej: Tengo que exportar reportes a PDF a mano porque Arcom no lo hace."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: ¿Qué proponés?
+      description: Describí la función o mejora que te gustaría.
+      placeholder: "Ej: Poder exportar el reporte diario a PDF desde el panel."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Prioridad para vos
+      description: ¿Qué tan importante es esta función para tu negocio?
+      options:
+        - Crítica — la necesito ya
+        - Alta — la necesito pronto
+        - Media — sería buena mejora
+        - Baja — solo si sobra tiempo
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Contexto adicional (opcional)
+      description: Cualquier detalle que ayude a entender tu solicitud.
+    validations:
+      required: false
