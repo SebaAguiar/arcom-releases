@@ -1,0 +1,416 @@
+name: Build & Publish
+
+# ──────────────────────────────────────────────────────────────
+# Builds the Arcom desktop app from the PRIVATE source repo
+# SebaAguiar/arpos-v2 (read via the read-only SSH deploy key
+# ARPOS_SOURCE_KEY) and publishes installers + updater signatures to
+# THIS public repo, where Actions minutes are unlimited and free.
+#
+# Triggers:
+#   - repository_dispatch (release-tag): fired by arpos-v2's
+#     .github/workflows/release.yml when a version tag is pushed.
+#   - workflow_dispatch: manual runs — macOS on demand, re-runs,
+#     partial rebuilds. Inputs: tag (required), platforms, update_ota_anchor.
+#
+# Platform policy:
+#   - prerelease tags (vX.Y.Z-...) → linux + windows. macOS is dispatched
+#     on demand: it is the slowest runner (it defines the wall-clock of
+#     the whole matrix) and beta testers do not need a DMG per beta.
+#   - stable tags (vX.Y.Z) → all three, so a stable release can never
+#     ship without a DMG.
+#
+# Secrets:
+#   - environment `release`: TAURI_SIGNING_PRIVATE_KEY, VITE_LICENSE_PUBLIC_KEY
+#   - repository: ARPOS_SOURCE_KEY (read-only deploy key into arpos-v2)
+# ──────────────────────────────────────────────────────────────
+
+on:
+  repository_dispatch:
+    types: [release-tag]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag of arpos-v2 to build (e.g. v1.0.0-beta.12)"
+        required: true
+        type: string
+      platforms:
+        description: "Comma list: linux,windows,macos — or 'all'. Empty = policy by tag type"
+        required: false
+        default: ""
+        type: string
+      update_ota_anchor:
+        description: "Refresh the 'updates' anchor release (latest.json) after publishing"
+        required: false
+        default: true
+        type: boolean
+
+# Read-only by default: only the publish job escalates to contents: write.
+permissions:
+  contents: read
+
+# Two runs on the same tag would clobber each other's assets.
+concurrency:
+  group: release-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # ── Resolve tag, platform matrix and anchor policy ──────────
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+      update_anchor: ${{ steps.meta.outputs.update_anchor }}
+    steps:
+      - name: Resolve tag, platforms and anchor policy
+        id: meta
+        env:
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_UPDATE_ANCHOR: ${{ inputs.update_ota_anchor }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          TAG="${DISPATCH_TAG:-${INPUT_TAG:-}}"
+          if [[ "$TAG" != v* ]]; then
+            echo "::error::Resolved tag '$TAG' must start with v (event: '$EVENT_NAME')."
+            exit 1
+          fi
+
+          if [[ -n "${INPUT_PLATFORMS:-}" ]]; then
+            WANTED="$INPUT_PLATFORMS"
+          elif [[ "$TAG" == *-* ]]; then
+            WANTED="linux,windows"
+          else
+            WANTED="all"
+          fi
+          if [[ "$WANTED" == "all" ]]; then WANTED="linux,windows,macos"; fi
+
+          include='[]'
+          for p in ${WANTED//,/ }; do
+            case "$p" in
+              linux)   entry='{"os":"ubuntu-latest","bundle-name":"linux"}' ;;
+              windows) entry='{"os":"windows-latest","bundle-name":"windows"}' ;;
+              macos)   entry='{"os":"macos-latest","bundle-name":"macos"}' ;;
+              *) echo "::error::Unknown platform '$p' (use linux,windows,macos or all)"; exit 1 ;;
+            esac
+            include=$(jq -c --argjson e "$entry" '. + [$e]' <<<"$include")
+          done
+
+          if [[ "$(jq 'length' <<<"$include")" -eq 0 ]]; then
+            echo "::error::No platforms selected."
+            exit 1
+          fi
+
+          # The 'updates' anchor is what makes /releases/latest serve
+          # latest.json while every app release is a prerelease. A partial
+          # run (e.g. macOS on demand) MUST refresh it too: otherwise the
+          # manifest would keep omitting darwin-aarch64 and those installs
+          # would never see an update. Defaults to on.
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            UPDATE_ANCHOR="true"
+          else
+            UPDATE_ANCHOR="${INPUT_UPDATE_ANCHOR:-true}"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(jq -c '{include: .}' <<<"$include")" >> "$GITHUB_OUTPUT"
+          echo "update_anchor=$UPDATE_ANCHOR" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG | platforms=$WANTED | update_anchor=$UPDATE_ANCHOR"
+
+  # ── Build signed bundles (deb/rpm/AppImage, dmg, nsis) ──────
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    environment: release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The source is private: check it out from arpos-v2 instead of the
+      # repository this workflow lives in. Everything else the build needs
+      # (.github/scripts, CHANGELOG.md, pnpm-lock, Cargo.lock) comes with it.
+      - name: Checkout source (private arpos-v2)
+        uses: actions/checkout@v5
+        with:
+          repository: SebaAguiar/arpos-v2
+          ref: ${{ needs.plan.outputs.tag }}
+          ssh-key: ${{ secrets.ARPOS_SOURCE_KEY }}
+
+      # A tag pushed without bumping tauri.conf.json would publish
+      # installers whose version disagrees with the tag and poison
+      # latest.json with a manifest version nobody can update to.
+      - name: Check tag matches the app version
+        run: |
+          set -euo pipefail
+          CONF="$(node -p "require('./apps/arcom-launcher/src-tauri/tauri.conf.json').version")"
+          TAG_VERSION="${{ needs.plan.outputs.tag }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          if [[ "$CONF" != "$TAG_VERSION" ]]; then
+            echo "::error::Tag v$TAG_VERSION but tauri.conf.json says $CONF — bump the version before tagging."
+            exit 1
+          fi
+          echo "Tag v$TAG_VERSION matches tauri.conf.json ($CONF)"
+
+      # ── Node.js + pnpm ────────────────────────────────────
+      - uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      # ── Rust ──────────────────────────────────────────────
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/arcom-launcher/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('apps/arcom-launcher/src-tauri/Cargo.lock') }}
+
+      # ── Linux system deps (Tauri) ─────────────────────────
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libayatana-appindicator3-dev
+
+      # ── Install JS deps ───────────────────────────────────
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Generate Prisma client ────────────────────────────
+      - name: Generate Prisma client
+        run: pnpm --filter api exec prisma generate
+
+      # ── Create env file for API build ─────────────────────
+      # JWT_SECRET is generated per build, never a hardcoded literal: this
+      # .env is bundled into the installer by scripts/build-sidecar.mjs, so a
+      # fixed value would ship a publicly known secret inside every release
+      # and let anyone forge a JWT against the local sidecar API.
+      - name: Create env file
+        run: |
+          echo 'DATABASE_URL="file:./dev.db"' > apps/api/.env
+          echo 'PORT=3000' >> apps/api/.env
+          echo "JWT_SECRET=\"$(openssl rand -hex 32)\"" >> apps/api/.env
+
+      # ── Build signed Tauri bundles ────────────────────────
+      # .sig files are produced here because TAURI_SIGNING_PRIVATE_KEY is
+      # set from the `release` environment. The keypair was regenerated on
+      # 2026-10-18 (the original lived only inside arpos-v2's secrets and
+      # could not be exported), so installs built before that date verify
+      # updates against the OLD pubkey and must be reinstalled by hand.
+      #
+      # Vite inlines import.meta.env.VITE_* at build time; pos-react is
+      # built by beforeBuildCommand, so these MUST be on this step. A
+      # missing key does not fail the build — it emits a bundle that throws
+      # at module load, which verify-pos-bundle.mjs catches below.
+      #
+      # LICENSE_PUBLIC_KEY is read by the Rust side with option_env! and
+      # forwarded to the sidecar at spawn time. It is the SAME key as
+      # VITE_LICENSE_PUBLIC_KEY: the POS verifies the license it was given,
+      # the sidecar verifies the same token before bridging the identity
+      # into a local session. If they diverge, license login breaks.
+      #
+      # VITE_CLOUD_API_BASE is intentionally EMPTY until the admin-panel
+      # relay is deployed (see ROADMAP Fase 6). The verify script passes
+      # with an empty value because "" never falls back to the localhost
+      # literal — so a green check here does NOT mean the relay is
+      # configured. Set the secret in this repo when the relay ships.
+      - name: Build Tauri app (signed bundles)
+        run: |
+          BUNDLES_ARGS=""
+          # WiX/MSI rejects non-numeric prerelease versions
+          # (e.g. 1.0.0-beta: "optional pre-release identifier ...
+          # numeric-only). Prerelease tags ship Windows NSIS only;
+          # stable tags keep msi + nsis.
+          if [ "${{ matrix.os }}" = "windows-latest" ] && [[ "${{ needs.plan.outputs.tag }}" == *-* ]]; then
+            BUNDLES_ARGS="--bundles nsis"
+          fi
+          pnpm --filter arcom-launcher tauri build $BUNDLES_ARGS
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          VITE_LICENSE_PUBLIC_KEY: ${{ secrets.VITE_LICENSE_PUBLIC_KEY }}
+          LICENSE_PUBLIC_KEY: ${{ secrets.VITE_LICENSE_PUBLIC_KEY }}
+          VITE_CLOUD_API_BASE: ${{ secrets.VITE_CLOUD_API_BASE }}
+
+      # ── Verify POS bundle configuration ───────────────────
+      # Fail here rather than on a customer machine. Runs on every matrix
+      # job so a per-OS regression cannot ship.
+      - name: Verify POS bundle configuration
+        run: node .github/scripts/verify-pos-bundle.mjs
+
+      # ── Stage release artifacts ───────────────────────────
+      # Upload only the final installers + their .sig files.
+      # Uploading the whole bundle dir would publish build internals
+      # (AppImage AppDir, .deb/.rpm temp files) and break the release
+      # upload. The macOS updater bundle (*.app.tar.gz) is only produced
+      # when createUpdaterArtifacts is true — it is required for darwin
+      # aarch64 updates.
+      - name: Stage release artifacts
+        run: |
+          mkdir -p staging
+          find apps/arcom-launcher/src-tauri/target/release/bundle -type f \( \
+            -name "*.deb" -o \
+            -name "*.rpm" -o \
+            -name "*.AppImage" -o \
+            -name "*.dmg" -o \
+            -name "*.msi" -o \
+            -name "*.exe" -o \
+            -name "*.sig" -o \
+            -name "*.tar.gz" ! -name "control.tar.gz" ! -name "data.tar.gz" \
+          \) -exec cp {} staging/ \;
+
+      - name: Upload bundles as artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: bundles-${{ matrix.bundle-name }}
+          path: staging/
+          retention-days: 5
+
+  # ── Merge, manifest, publish ────────────────────────────────
+  create-release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      # Needed for .github/scripts/generate-latest-json.mjs and
+      # CHANGELOG.md (release notes). gh must NOT infer the target repo
+      # from this checkout — that is the private source — so every gh call
+      # below passes --repo explicitly.
+      - name: Checkout source (scripts + changelog)
+        uses: actions/checkout@v5
+        with:
+          repository: SebaAguiar/arpos-v2
+          ref: ${{ needs.plan.outputs.tag }}
+          ssh-key: ${{ secrets.ARPOS_SOURCE_KEY }}
+
+      - name: Download bundles from this run
+        uses: actions/download-artifact@v5
+        with:
+          pattern: bundles-*
+          merge-multiple: true
+          path: release-artifacts
+
+      # A partial run (macOS on demand) must merge with what the tag
+      # already published, otherwise regenerating latest.json would drop
+      # the linux/windows platforms from the OTA manifest.
+      - name: Fold in assets already published for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo SebaAguiar/arcom-releases >/dev/null 2>&1; then
+            mkdir -p already-published
+            gh release download "$TAG" --repo SebaAguiar/arcom-releases --dir already-published
+            # Files from this run win; existing assets only fill the gaps.
+            find already-published -type f -exec cp -n {} release-artifacts/ \;
+            echo "Merged $(find already-published -type f | wc -l) already-published asset(s)"
+          else
+            echo "No release published for $TAG yet (first build of this tag)"
+          fi
+
+      - name: List artifacts
+        run: find release-artifacts -type f | sort
+
+      - name: Verify updater signatures present
+        run: |
+          sigs=$(find release-artifacts -name "*.sig" | wc -l)
+          if [ "$sigs" -eq 0 ]; then
+            echo "::error::No .sig files found — updater artifacts were not generated (check createUpdaterArtifacts in tauri.conf.json, and that TAURI_SIGNING_PRIVATE_KEY resolved from the 'release' environment)."
+            exit 1
+          fi
+          echo "Found $sigs signature file(s)"
+
+      # ── Generate the Tauri updater manifest ───────────────
+      # The tauri-plugin-updater does not parse the GitHub API
+      # releases/latest JSON; it expects the static latest.json format
+      # ({ version, platforms: { "<os>-<arch>": { url, signature } } }),
+      # uploaded as an asset of the same release so it is reachable at
+      # .../releases/latest/download/latest.json.
+      - uses: pnpm/action-setup@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Generate updater manifest
+        run: node .github/scripts/generate-latest-json.mjs
+        env:
+          ARTIFACTS_DIR: release-artifacts
+          TAG: ${{ needs.plan.outputs.tag }}
+          REPO: SebaAguiar/arcom-releases
+          NOTES_FILE: CHANGELOG.md
+
+      - name: List artifacts (with manifest)
+        run: find release-artifacts -type f | sort
+
+      # ── Publish the release ───────────────────────────────
+      # Idempotent: re-running a workflow that already published the tag
+      # must update the release instead of failing with "already exists".
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          NOTES_FILE: CHANGELOG.md
+          PRERELEASE: ${{ contains(needs.plan.outputs.tag, '-beta') || contains(needs.plan.outputs.tag, '-rc') || contains(needs.plan.outputs.tag, '-alpha') }}
+        run: |
+          set -euo pipefail
+          PRERELEASE_FLAG=""
+          if [ "$PRERELEASE" = "true" ]; then PRERELEASE_FLAG="--prerelease"; fi
+          if gh release view "$TAG" --repo SebaAguiar/arcom-releases >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo SebaAguiar/arcom-releases \
+              --title "Arcom $TAG" \
+              --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" release-artifacts/* \
+              --repo SebaAguiar/arcom-releases --clobber
+          else
+            gh release create "$TAG" release-artifacts/* \
+              --repo SebaAguiar/arcom-releases \
+              --title "Arcom $TAG" \
+              --notes-file "$NOTES_FILE" \
+              $PRERELEASE_FLAG
+          fi
+
+      # ── Refresh the OTA manifest anchor ───────────────────
+      # GitHub's /releases/latest only resolves to non-prerelease releases,
+      # so a beta-only distribution strategy makes the updater endpoint
+      #   .../releases/latest/download/latest.json
+      # 404 and in-app updates fail. Keep a stable anchor release (tag
+      # `updates`) whose sole asset is the freshly generated latest.json.
+      - name: Publish latest.json to stable OTA anchor
+        if: needs.plan.outputs.update_anchor == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view updates --repo SebaAguiar/arcom-releases >/dev/null 2>&1; then
+            gh release create updates \
+              --repo SebaAguiar/arcom-releases \
+              --title "OTA manifest anchor" \
+              --notes "Stable anchor so /releases/latest serves latest.json while app releases are prereleases."
+          fi
+          gh release upload updates release-artifacts/latest.json \
+            --repo SebaAguiar/arcom-releases --clobber
