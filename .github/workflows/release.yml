@@ -364,6 +364,17 @@ jobs:
           REPO: SebaAguiar/arcom-releases
           NOTES_FILE: CHANGELOG.md
 
+      # ── Create clean friendly aliases for human download ──
+      - name: Create friendly public download aliases
+        run: |
+          cd release-artifacts
+          for f in *x64-setup.exe; do [ -f "$f" ] && cp -v "$f" Arcom-Setup.exe || true; done
+          for f in *amd64.AppImage; do [ -f "$f" ] && cp -v "$f" Arcom.AppImage || true; done
+          for f in *amd64.deb; do [ -f "$f" ] && cp -v "$f" Arcom.deb || true; done
+          for f in *.x86_64.rpm; do [ -f "$f" ] && cp -v "$f" Arcom.rpm || true; done
+          for f in *.dmg; do [ -f "$f" ] && cp -v "$f" Arcom.dmg || true; done
+          for f in *x64*.msi; do [ -f "$f" ] && cp -v "$f" Arcom.msi || true; done
+
       - name: List artifacts (with manifest)
         run: find release-artifacts -type f | sort
 
